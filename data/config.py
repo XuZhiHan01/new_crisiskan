@@ -25,6 +25,16 @@ TASK_CONFIG = {
             'injured_or_dead_people': 6,
             'missing_or_found_people': 7,
         }
+
+    },
+    'task3': {
+            'name': 'damage',  # 对应文件名 task_damage_text_img_train.tsv
+            'num_classes': 3,
+            'label_map': {
+                'severe_damage': 0,
+                'mild_damage': 1,
+                'little_or_no_damage': 2
+            }
     }
 }
 

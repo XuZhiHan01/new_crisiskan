@@ -1,4 +1,4 @@
-# train_modular.py
+# train_hga.py
 
 import os
 import argparse
@@ -12,53 +12,56 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, f1_score
 
-# 导入我们需要的所有模块
+# 导入通用组件
 from data import CrisisDataset, TextProcessor, get_transforms, DEFAULT_DATA_ROOT, TASK_CONFIG
+# 导入模块 (注意这里我们用 HGAFusion)
 from modules import (
     DenseNetVisualEncoder,
     ElectraTextEncoder,
-    CrisisKANFusion,
+    HGAFusion,  # <--- 主角：HGA 融合模块
     CrisisKANClassifier,
     ModularCrisisModel
 )
 
 
 # ==========================================
-# 1. 参数配置中心 (The Cockpit)
+# 1. 参数配置 (增加了 HGA 特有参数)
 # ==========================================
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train Modular CrisisKAN Model")
+    parser = argparse.ArgumentParser(description="Train HGA-Net (Innovation Model)")
 
     # --- 基础配置 ---
-    parser.add_argument('--task_name', type=str, default='task2', choices=['task1', 'task2', 'taks3'], help='任务名称')
-    parser.add_argument('--run_name', type=str, default='experiment_01', help='本次实验的名称(用于保存文件)')
-    parser.add_argument('--output_dir', type=str, default='./output_modular', help='模型保存路径')
-    parser.add_argument('--seed', type=int, default=42, help='随机种子(复现性)')
+    parser.add_argument('--task_name', type=str, default='task2', choices=['task1', 'task2', 'task3'], help='任务名称')
+    parser.add_argument('--run_name', type=str, default='hga_experiment_01', help='实验名称')
+    parser.add_argument('--output_dir', type=str, default='./output_hga', help='保存路径')
+    parser.add_argument('--seed', type=int, default=42)
 
     # --- 数据配置 ---
-    parser.add_argument('--data_root', type=str, default=DEFAULT_DATA_ROOT, help='数据集根目录')
-    parser.add_argument('--batch_size', type=int, default=8, help='训练批次大小 (显存不够就调小)')
-    parser.add_argument('--num_workers', type=int, default=4, help='数据加载线程数')
+    parser.add_argument('--data_root', type=str, default=DEFAULT_DATA_ROOT)
+    parser.add_argument('--batch_size', type=int, default=8)  # HGA 显存占用可能稍大，如果 OOM 请调小
+    parser.add_argument('--num_workers', type=int, default=4)
 
     # --- 训练超参数 ---
-    parser.add_argument('--epochs', type=int, default=20, help='总训练轮数')
-    parser.add_argument('--lr', type=float, default=2e-5, help='学习率')
-    parser.add_argument('--weight_decay', type=float, default=1e-2, help='权重衰减')
-    parser.add_argument('--patience', type=int, default=5, help='Early Stopping 耐心轮数')
+    parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument('--lr', type=float, default=2e-5)
+    parser.add_argument('--weight_decay', type=float, default=1e-2)
+    parser.add_argument('--patience', type=int, default=5)
 
-    # --- 模型结构参数 (可自由定制) ---
-    parser.add_argument('--visual_weights', type=str, default='../local_models/densenet201-c1103571.pth',
-                        help='视觉模型权重路径')
-    parser.add_argument('--text_model_path', type=str, default='../local_models/google/electra-base-discriminator',
-                        help='文本模型路径')
-    parser.add_argument('--proj_dim', type=int, default=100, help='融合投影维度')
-    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout比率')
+    # --- 模型结构参数 (HGA 专属) ---
+    parser.add_argument('--visual_weights', type=str, default='../local_models/densenet201-c1103571.pth')
+    parser.add_argument('--text_model_path', type=str, default='../local_models/google/electra-base-discriminator')
+
+    # [关键创新参数]
+    parser.add_argument('--embed_dim', type=int, default=256, help='HGA 内部交互维度')
+    parser.add_argument('--num_heads', type=int, default=4, help='Transformer 头数')
+    parser.add_argument('--layers', type=int, default=1, help='交互层深度')
+    parser.add_argument('--dropout', type=float, default=0.1)
 
     return parser.parse_args()
 
 
 # ==========================================
-# 2. 工具函数
+# 2. 工具函数 (保持不变)
 # ==========================================
 def set_seed(seed):
     random.seed(seed)
@@ -84,7 +87,7 @@ def setup_logger(output_dir):
 
 
 # ==========================================
-# 3. 核心训练与验证循环
+# 3. 训练循环 (保持不变)
 # ==========================================
 def train_epoch(model, loader, optimizer, criterion, device, epoch):
     model.train()
@@ -94,25 +97,18 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch):
 
     loop = tqdm(loader, desc=f"Train Epoch {epoch}")
     for batch in loop:
-        # 1. 数据搬运到 GPU
         images = batch['image'].to(device)
         text_inputs = {k: v.to(device) for k, v in batch['text_tokens'].items()}
         labels = batch['label'].to(device)
 
-        # 2. 前向传播
         optimizer.zero_grad()
-        # 兼容 Dataset 字典格式，重新打包
         inputs = {'image': images, 'text_tokens': text_inputs}
         logits = model(inputs)
 
-        # 3. 计算 Loss
         loss = criterion(logits, labels)
-
-        # 4. 反向传播
         loss.backward()
         optimizer.step()
 
-        # 5. 统计
         total_loss += loss.item()
         preds = torch.argmax(logits, dim=1)
         correct += (preds == labels).sum().item()
@@ -145,31 +141,28 @@ def evaluate(model, loader, criterion, device):
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 
-    # 计算指标
     acc = accuracy_score(all_labels, all_preds)
     f1 = f1_score(all_labels, all_preds, average='weighted')
-
     return total_loss / len(loader), acc, f1
 
 
 # ==========================================
-# 4. 主程序 (The Pilot)
+# 4. 主程序 (组装 HGA-Net)
 # ==========================================
 def main():
     args = parse_args()
     set_seed(args.seed)
 
-    # 1. 准备目录和日志
     save_dir = os.path.join(args.output_dir, args.run_name)
     logger = setup_logger(save_dir)
-    logger.info(f"Starting Experiment: {args.run_name}")
-    logger.info(f"Config: {args}")
+    logger.info(f"🚀 Starting HGA-Net Experiment: {args.run_name}")
+    logger.info(f"📝 Config: {args}")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"⚙Device: {device}")
+    logger.info(f"⚙️ Device: {device}")
 
-    # 2. 准备数据
-    logger.info("Loading Datasets...")
+    # 1. 数据准备
+    logger.info("📚 Loading Datasets...")
     text_proc = TextProcessor(model_name=args.text_model_path)
     train_transform = get_transforms(mode='train')
     eval_transform = get_transforms(mode='eval')
@@ -181,67 +174,73 @@ def main():
     dev_loader = DataLoader(dev_set, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     num_classes = TASK_CONFIG[args.task_name]['num_classes']
-    logger.info(f"Task: {args.task_name} | Classes: {num_classes} | Train Size: {len(train_set)}")
 
-    # 3. 组装模型 (Modular Assembly)
-    logger.info("🏗Building Modular Model...")
-    # A. 视觉编码器
+    # 2. [核心] 组装 HGA-Net
+    logger.info("🏗️ Assembling HGA-Net (Fine-Grained Interaction)...")
+
+    # A. 视觉编码器 (现在返回序列 49x1920)
     vis_enc = DenseNetVisualEncoder(weights_path=args.visual_weights)
-    # B. 文本编码器
+
+    # B. 文本编码器 (现在返回序列 Seqx768)
     txt_enc = ElectraTextEncoder(model_path=args.text_model_path)
-    # C. 融合层
-    fusion = CrisisKANFusion(
-        visual_dim=vis_enc.output_dim,
-        text_dim=txt_enc.output_dim,
-        proj_dim=args.proj_dim
+
+    # C. HGA 融合模块 (处理序列交互)
+    fusion = HGAFusion(
+        visual_dim=vis_enc.output_dim,  # 1920
+        text_dim=txt_enc.output_dim,  # 768
+        embed_dim=args.embed_dim,  # 256
+        num_heads=args.num_heads,  # 4
+        layers=args.layers  # 1
     )
-    # D. 分类头
+
+    # D. 分类头 (输入是 fusion 的输出维度)
     cls_head = CrisisKANClassifier(
-        input_dim=fusion.output_dim,
+        input_dim=fusion.output_dim,  # 256 * 2 = 512
         num_classes=num_classes,
         dropout_rate=args.dropout
     )
+
     # E. 总装
     model = ModularCrisisModel(vis_enc, txt_enc, fusion, cls_head)
     model.to(device)
 
-    # 4. 优化器与损失
+    # 3. 训练配置
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = nn.CrossEntropyLoss()
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2, verbose=True)
 
-    # 5. 开始训练
-    logger.info("Start Training...")
+    # 4. 开始训练
+    logger.info("🔥 Start Training HGA-Net...")
     best_f1 = 0.0
     patience_counter = 0
 
     for epoch in range(1, args.epochs + 1):
-        # --- Train ---
+        # Train
         train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, device, epoch)
         logger.info(f"[Epoch {epoch}] Train Loss: {train_loss:.4f} | Acc: {train_acc:.4f}")
 
-        # --- Validation ---
+        # Validation
         val_loss, val_acc, val_f1 = evaluate(model, dev_loader, criterion, device)
         logger.info(f"[Epoch {epoch}] Val Loss: {val_loss:.4f} | Acc: {val_acc:.4f} | F1: {val_f1:.4f}")
 
         scheduler.step(val_f1)
 
-        # --- Save Best ---
+        # Save Best
         if val_f1 > best_f1:
             best_f1 = val_f1
             patience_counter = 0
             save_path = os.path.join(save_dir, 'best_model.pt')
             torch.save(model.state_dict(), save_path)
-            logger.info(f"New Best Model Saved! (F1: {best_f1:.4f})")
+            logger.info(f"🌟 New Best Model Saved! (F1: {best_f1:.4f})")
         else:
             patience_counter += 1
-            logger.info(f"No improvement. Patience: {patience_counter}/{args.patience}")
+            logger.info(f"⏳ No improvement. Patience: {patience_counter}/{args.patience}")
 
         if patience_counter >= args.patience:
-            logger.info("Early Stopping triggered.")
+            logger.info("🛑 Early Stopping triggered.")
             break
 
-    logger.info("Training Finished.")
+    logger.info("✅ HGA-Net Training Finished.")
 
 
 if __name__ == "__main__":
