@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import torchvision.models as models
 from transformers import ElectraModel, ElectraConfig
 from collections import OrderedDict
-
+from transformers import AutoModel, AutoConfig
 
 # ==========================================
 # 1. 定义基类
@@ -131,4 +131,58 @@ class ElectraTextEncoder(BaseTextEncoder):
         # (B, Seq_Len, 768)
         last_hidden_state = outputs.last_hidden_state
 
+        return self.dropout(last_hidden_state)
+
+
+class ResNetVisualEncoder(BaseVisualEncoder):
+    def __init__(self, weights_path='', pretrained=None):
+        super().__init__()
+        # 加载预训练的 ResNet50
+        # 注意：torchvision 新版本推荐用 weights=... 参数
+        self.backbone = models.resnet50(weights=None)
+
+        # 2. 手动加载本地权重
+        if weights_path:
+            print(f"[VisualEncoder] Loading ResNet weights from {weights_path}")
+            state_dict = torch.load(weights_path, map_location='cpu')
+            self.backbone.load_state_dict(state_dict)
+        elif pretrained:
+            # 如果没给路径但要求 pretrained，尝试官方自动加载 (需要联网)
+            from torchvision.models import ResNet50_Weights
+            self.backbone = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
+
+        # 3. 去掉最后两层 (FC 和 AvgPool)
+        self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-2])
+        self.output_dim = 2048
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, images):
+        # 1. 提取特征图 (B, 2048, 7, 7)
+        features = self.feature_extractor(images)
+
+        # 2. 空间展平 (B, 2048, 49)
+        B, C, H, W = features.shape
+        features = features.view(B, C, H * W)
+
+        # 3. 维度置换 -> (B, 49, 2048) 适配 HGA
+        features = features.permute(0, 2, 1)
+
+        return self.dropout(features)
+
+
+# === 新增：BERTweet 文本编码器 ===
+class BERTweetTextEncoder(BaseTextEncoder):
+    def __init__(self, model_path=''):
+        super().__init__()
+        self.output_dim = 768
+
+        print(f"[TextEncoder] Loading BERTweet from {model_path} ...")
+        # 自动加载配置和模型
+        self.backbone = AutoModel.from_pretrained(model_path)
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, text_inputs):
+        outputs = self.backbone(**text_inputs)
+        # 获取序列特征 (B, Seq_Len, 768)
+        last_hidden_state = outputs.last_hidden_state
         return self.dropout(last_hidden_state)

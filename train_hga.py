@@ -14,47 +14,53 @@ from sklearn.metrics import accuracy_score, f1_score
 
 # 导入通用组件
 from data import CrisisDataset, TextProcessor, get_transforms, DEFAULT_DATA_ROOT, TASK_CONFIG
-# 导入模块 (注意这里我们用 HGAFusion)
+
+# 1. 导入新模块 (ResNet & BERTweet)
 from modules import (
-    DenseNetVisualEncoder,
-    ElectraTextEncoder,
-    HGAFusion,  # <--- 主角：HGA 融合模块
+    ResNetVisualEncoder,  # <--- 新增
+    BERTweetTextEncoder,  # <--- 新增
+    HGAFusion,
     CrisisKANClassifier,
     ModularCrisisModel
 )
 
 
 # ==========================================
-# 1. 参数配置 (增加了 HGA 特有参数)
+# 1. 参数配置
 # ==========================================
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train HGA-Net (Innovation Model)")
+    parser = argparse.ArgumentParser(description="Train HGA-Net with ResNet & BERTweet")
 
     # --- 基础配置 ---
-    parser.add_argument('--task_name', type=str, default='task2', choices=['task1', 'task2', 'task3'], help='任务名称')
-    parser.add_argument('--run_name', type=str, default='hga_experiment_01', help='实验名称')
+    parser.add_argument('--task_name', type=str, default='task2', choices=['task1', 'task2', 'task3'])
+    parser.add_argument('--run_name', type=str, default='hga_resnet_bertweet_exp', help='实验名称')
     parser.add_argument('--output_dir', type=str, default='./output_hga', help='保存路径')
     parser.add_argument('--seed', type=int, default=42)
 
     # --- 数据配置 ---
     parser.add_argument('--data_root', type=str, default=DEFAULT_DATA_ROOT)
-    parser.add_argument('--batch_size', type=int, default=8)  # HGA 显存占用可能稍大，如果 OOM 请调小
+    parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--num_workers', type=int, default=4)
 
     # --- 训练超参数 ---
     parser.add_argument('--epochs', type=int, default=20)
-    parser.add_argument('--lr', type=float, default=2e-5)
+    parser.add_argument('--lr', type=float, default=1e-5)  # BERTweet 建议学习率稍微低一点
     parser.add_argument('--weight_decay', type=float, default=1e-2)
     parser.add_argument('--patience', type=int, default=5)
 
-    # --- 模型结构参数 (HGA 专属) ---
-    parser.add_argument('--visual_weights', type=str, default='../local_models/densenet201-c1103571.pth')
-    parser.add_argument('--text_model_path', type=str, default='../local_models/google/electra-base-discriminator')
+    # --- 模型路径配置 (指向你下载的新权重) ---
+    # 视觉: ResNet50
+    parser.add_argument('--visual_weights', type=str, default='../local_models/resnet50-0676ba61.pth',
+                        help='本地 ResNet50 权重路径 (如果没下载，设为 "" 或 None 即可自动下载)')
 
-    # [关键创新参数]
-    parser.add_argument('--embed_dim', type=int, default=256, help='HGA 内部交互维度')
-    parser.add_argument('--num_heads', type=int, default=4, help='Transformer 头数')
-    parser.add_argument('--layers', type=int, default=1, help='交互层深度')
+    # 文本: BERTweet
+    parser.add_argument('--text_model_path', type=str, default='../local_models/vinai/bertweet-basee',
+                        help='本地 BERTweet 文件夹路径')
+
+    # --- HGA 结构参数 ---
+    parser.add_argument('--embed_dim', type=int, default=256)
+    parser.add_argument('--num_heads', type=int, default=4)
+    parser.add_argument('--layers', type=int, default=1)
     parser.add_argument('--dropout', type=float, default=0.1)
 
     return parser.parse_args()
@@ -147,7 +153,7 @@ def evaluate(model, loader, criterion, device):
 
 
 # ==========================================
-# 4. 主程序 (组装 HGA-Net)
+# 4. 主程序 (组装升级版 HGA-Net)
 # ==========================================
 def main():
     args = parse_args()
@@ -155,7 +161,7 @@ def main():
 
     save_dir = os.path.join(args.output_dir, args.run_name)
     logger = setup_logger(save_dir)
-    logger.info(f"🚀 Starting HGA-Net Experiment: {args.run_name}")
+    logger.info(f"🚀 Starting HGA-Net (ResNet+BERTweet): {args.run_name}")
     logger.info(f"📝 Config: {args}")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -163,6 +169,7 @@ def main():
 
     # 1. 数据准备
     logger.info("📚 Loading Datasets...")
+    # 注意：这里传入 BERTweet 的路径，确保 Tokenizer 正确加载
     text_proc = TextProcessor(model_name=args.text_model_path)
     train_transform = get_transforms(mode='train')
     eval_transform = get_transforms(mode='eval')
@@ -175,27 +182,31 @@ def main():
 
     num_classes = TASK_CONFIG[args.task_name]['num_classes']
 
-    # 2. [核心] 组装 HGA-Net
-    logger.info("🏗️ Assembling HGA-Net (Fine-Grained Interaction)...")
+    # 2. [核心] 组装新模型
+    logger.info("🏗️ Assembling HGA-Net Components...")
 
-    # A. 视觉编码器 (现在返回序列 49x1920)
-    vis_enc = DenseNetVisualEncoder(weights_path=args.visual_weights)
+    # A. 视觉: ResNet50
+    # weights_path 为空时会自动下载(如果可以联网)
+    vis_weight = args.visual_weights if os.path.exists(args.visual_weights) else None
+    vis_enc = ResNetVisualEncoder(weights_path=vis_weight, pretrained=True)
+    logger.info(f"Visual: ResNet50 (Dim: {vis_enc.output_dim})")
 
-    # B. 文本编码器 (现在返回序列 Seqx768)
-    txt_enc = ElectraTextEncoder(model_path=args.text_model_path)
+    # B. 文本: BERTweet
+    txt_enc = BERTweetTextEncoder(model_path=args.text_model_path)
+    logger.info(f"Text: BERTweet (Dim: {txt_enc.output_dim})")
 
-    # C. HGA 融合模块 (处理序列交互)
+    # C. HGA 融合
     fusion = HGAFusion(
-        visual_dim=vis_enc.output_dim,  # 1920
+        visual_dim=vis_enc.output_dim,  # 2048
         text_dim=txt_enc.output_dim,  # 768
         embed_dim=args.embed_dim,  # 256
-        num_heads=args.num_heads,  # 4
-        layers=args.layers  # 1
+        num_heads=args.num_heads,
+        layers=args.layers
     )
 
-    # D. 分类头 (输入是 fusion 的输出维度)
+    # D. 分类头
     cls_head = CrisisKANClassifier(
-        input_dim=fusion.output_dim,  # 256 * 2 = 512
+        input_dim=fusion.output_dim,  # 512
         num_classes=num_classes,
         dropout_rate=args.dropout
     )
@@ -210,7 +221,7 @@ def main():
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2, verbose=True)
 
     # 4. 开始训练
-    logger.info("🔥 Start Training HGA-Net...")
+    logger.info("🔥 Start Training...")
     best_f1 = 0.0
     patience_counter = 0
 
@@ -240,7 +251,7 @@ def main():
             logger.info("🛑 Early Stopping triggered.")
             break
 
-    logger.info("✅ HGA-Net Training Finished.")
+    logger.info("✅ Training Finished.")
 
 
 if __name__ == "__main__":
