@@ -17,8 +17,8 @@ from data import CrisisDataset, TextProcessor, get_transforms, DEFAULT_DATA_ROOT
 
 # 1. 导入新模块 (ResNet & BERTweet)
 from modules import (
-    ResNetVisualEncoder,  # <--- 新增
-    BERTweetTextEncoder,  # <--- 新增
+    ResNetVisualEncoder,
+    BERTweetTextEncoder,
     HGAFusion,
     CrisisKANClassifier,
     ModularCrisisModel
@@ -44,17 +44,16 @@ def parse_args():
 
     # --- 训练超参数 ---
     parser.add_argument('--epochs', type=int, default=20)
-    parser.add_argument('--lr', type=float, default=1e-5)  # BERTweet 建议学习率稍微低一点
+    parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--weight_decay', type=float, default=1e-2)
     parser.add_argument('--patience', type=int, default=5)
 
-    # --- 模型路径配置 (指向你下载的新权重) ---
-    # 视觉: ResNet50
+    # --- 模型路径配置 ---
     parser.add_argument('--visual_weights', type=str, default='../local_models/resnet50-0676ba61.pth',
-                        help='本地 ResNet50 权重路径 (如果没下载，设为 "" 或 None 即可自动下载)')
+                        help='本地 ResNet50 权重路径')
 
-    # 文本: BERTweet
-    parser.add_argument('--text_model_path', type=str, default='../local_models/vinai/bertweet-basee',
+    # ✅ 修复了之前的拼写错误 (bertweet-basee -> bertweet-base)
+    parser.add_argument('--text_model_path', type=str, default='../local_models/vinai/bertweet-base',
                         help='本地 BERTweet 文件夹路径')
 
     # --- HGA 结构参数 ---
@@ -67,7 +66,7 @@ def parse_args():
 
 
 # ==========================================
-# 2. 工具函数 (保持不变)
+# 2. 工具函数
 # ==========================================
 def set_seed(seed):
     random.seed(seed)
@@ -93,7 +92,7 @@ def setup_logger(output_dir):
 
 
 # ==========================================
-# 3. 训练循环 (保持不变)
+# 3. 训练循环
 # ==========================================
 def train_epoch(model, loader, optimizer, criterion, device, epoch):
     model.train()
@@ -153,7 +152,7 @@ def evaluate(model, loader, criterion, device):
 
 
 # ==========================================
-# 4. 主程序 (组装升级版 HGA-Net)
+# 4. 主程序
 # ==========================================
 def main():
     args = parse_args()
@@ -162,14 +161,12 @@ def main():
     save_dir = os.path.join(args.output_dir, args.run_name)
     logger = setup_logger(save_dir)
     logger.info(f"🚀 Starting HGA-Net (ResNet+BERTweet): {args.run_name}")
-    logger.info(f"📝 Config: {args}")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"⚙️ Device: {device}")
 
     # 1. 数据准备
     logger.info("📚 Loading Datasets...")
-    # 注意：这里传入 BERTweet 的路径，确保 Tokenizer 正确加载
     text_proc = TextProcessor(model_name=args.text_model_path)
     train_transform = get_transforms(mode='train')
     eval_transform = get_transforms(mode='eval')
@@ -182,36 +179,28 @@ def main():
 
     num_classes = TASK_CONFIG[args.task_name]['num_classes']
 
-    # 2. [核心] 组装新模型
+    # 2. 组装模型
     logger.info("🏗️ Assembling HGA-Net Components...")
 
-    # A. 视觉: ResNet50
-    # weights_path 为空时会自动下载(如果可以联网)
     vis_weight = args.visual_weights if os.path.exists(args.visual_weights) else None
     vis_enc = ResNetVisualEncoder(weights_path=vis_weight, pretrained=True)
-    logger.info(f"Visual: ResNet50 (Dim: {vis_enc.output_dim})")
 
-    # B. 文本: BERTweet
     txt_enc = BERTweetTextEncoder(model_path=args.text_model_path)
-    logger.info(f"Text: BERTweet (Dim: {txt_enc.output_dim})")
 
-    # C. HGA 融合
     fusion = HGAFusion(
-        visual_dim=vis_enc.output_dim,  # 2048
-        text_dim=txt_enc.output_dim,  # 768
-        embed_dim=args.embed_dim,  # 256
+        visual_dim=vis_enc.output_dim,
+        text_dim=txt_enc.output_dim,
+        embed_dim=args.embed_dim,
         num_heads=args.num_heads,
         layers=args.layers
     )
 
-    # D. 分类头
     cls_head = CrisisKANClassifier(
-        input_dim=fusion.output_dim,  # 512
+        input_dim=fusion.output_dim,
         num_classes=num_classes,
         dropout_rate=args.dropout
     )
 
-    # E. 总装
     model = ModularCrisisModel(vis_enc, txt_enc, fusion, cls_head)
     model.to(device)
 
@@ -220,10 +209,38 @@ def main():
     criterion = nn.CrossEntropyLoss()
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2, verbose=True)
 
-    # 4. 开始训练
-    logger.info("🔥 Start Training...")
+    # ========================================================
+    # ✨ 核心修改：检查并加载 best_model.pt
+    # ========================================================
     best_f1 = 0.0
     patience_counter = 0
+    best_model_path = os.path.join(save_dir, 'best_model.pt')
+
+    if os.path.exists(best_model_path):
+        logger.info("\n" + "=" * 40)
+        logger.info(f"🔄 Found existing best model: {best_model_path}")
+        logger.info("📥 Loading weights to resume training...")
+        try:
+            state_dict = torch.load(best_model_path, map_location=device)
+            model.load_state_dict(state_dict)
+            logger.info("✅ Weights loaded successfully!")
+
+            # 关键步骤：先跑一次验证，确立基准线
+            logger.info("📊 Evaluating baseline performance (please wait)...")
+            _, _, init_f1 = evaluate(model, dev_loader, criterion, device)
+            best_f1 = init_f1
+            logger.info(f"🏁 Resuming with Baseline F1: {best_f1:.4f}")
+            logger.info("=" * 40 + "\n")
+
+        except Exception as e:
+            logger.error(f"❌ Error loading checkpoint: {e}")
+            logger.info("⚠️ Starting from scratch instead.")
+            logger.info("=" * 40 + "\n")
+    else:
+        logger.info("🆕 No existing checkpoint found. Starting fresh training.")
+
+    # 4. 开始训练
+    logger.info("🔥 Start Training Loop...")
 
     for epoch in range(1, args.epochs + 1):
         # Train
@@ -236,12 +253,11 @@ def main():
 
         scheduler.step(val_f1)
 
-        # Save Best
+        # Save Best (如果比基准线还好，就覆盖)
         if val_f1 > best_f1:
             best_f1 = val_f1
             patience_counter = 0
-            save_path = os.path.join(save_dir, 'best_model.pt')
-            torch.save(model.state_dict(), save_path)
+            torch.save(model.state_dict(), best_model_path)
             logger.info(f"🌟 New Best Model Saved! (F1: {best_f1:.4f})")
         else:
             patience_counter += 1
