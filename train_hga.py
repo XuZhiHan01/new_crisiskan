@@ -7,6 +7,7 @@ import random
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -26,6 +27,52 @@ from modules import (
 
 
 # ==========================================
+# 0. 新增：Focal Loss 实现
+# ==========================================
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        """
+        Args:
+            alpha (Tensor, optional): 类别权重，用于解决不平衡. Shape: (num_classes,)
+            gamma (float): 聚焦参数，越大越关注难分类样本. Default: 2.0
+            reduction (str): 'mean' | 'sum' | 'none'.
+        """
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        # inputs: (Batch, Num_Classes) -> Logits
+        # targets: (Batch) -> Labels
+
+        # 1. 计算 Cross Entropy Loss (不归约，保留每个样本的 Loss)
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+
+        # 2. 计算 pt (概率)
+        pt = torch.exp(-ce_loss)
+
+        # 3. 计算 Focal Term: (1 - pt)^gamma
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
+
+        # 4. 应用 Alpha (类别权重)
+        if self.alpha is not None:
+            # 获取每个样本对应的 alpha
+            if self.alpha.device != inputs.device:
+                self.alpha = self.alpha.to(inputs.device)
+            alpha_t = self.alpha[targets]
+            focal_loss = alpha_t * focal_loss
+
+        # 5. 归约
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
+# ==========================================
 # 1. 参数配置
 # ==========================================
 def parse_args():
@@ -33,7 +80,7 @@ def parse_args():
 
     # --- 基础配置 ---
     parser.add_argument('--task_name', type=str, default='task2', choices=['task1', 'task2', 'task3'])
-    parser.add_argument('--run_name', type=str, default='hga_resnet_bertweet_exp', help='实验名称')
+    parser.add_argument('--run_name', type=str, default='hga_focal_loss_exp', help='实验名称')  # 改个名，方便区分
     parser.add_argument('--output_dir', type=str, default='./output_hga', help='保存路径')
     parser.add_argument('--seed', type=int, default=42)
 
@@ -52,7 +99,6 @@ def parse_args():
     parser.add_argument('--visual_weights', type=str, default='../local_models/resnet50-0676ba61.pth',
                         help='本地 ResNet50 权重路径')
 
-    # ✅ 修复了之前的拼写错误 (bertweet-basee -> bertweet-base)
     parser.add_argument('--text_model_path', type=str, default='../local_models/vinai/bertweet-base',
                         help='本地 BERTweet 文件夹路径')
 
@@ -160,7 +206,7 @@ def main():
 
     save_dir = os.path.join(args.output_dir, args.run_name)
     logger = setup_logger(save_dir)
-    logger.info(f"🚀 Starting HGA-Net (ResNet+BERTweet): {args.run_name}")
+    logger.info(f"🚀 Starting HGA-Net (ResNet+BERTweet+FocalLoss): {args.run_name}")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"⚙️ Device: {device}")
@@ -206,12 +252,37 @@ def main():
 
     # 3. 训练配置
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    criterion = nn.CrossEntropyLoss()
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2, verbose=True)
 
     # ========================================================
-    # ✨ 核心修改：检查并加载 best_model.pt
+    # ✨ 核心修改：使用 Focal Loss 并设置 Class Weights
     # ========================================================
+    # 这里的权重是根据你的数据分布估算的：样本越少，权重越大
+    # 0: infra (319) -> 1.0
+    # 1: not_hum (849) -> 0.5 (最多)
+    # 2: other (578) -> 0.8
+    # 3: rescue (340) -> 1.0
+    # 4: vehicle (19) -> 5.0
+    # 5: affected (86) -> 4.0
+    # 6: injured (41) -> 8.0
+    # 7: missing (5) -> 15.0 (极少)
+
+    class_weights = torch.tensor([
+        1.0, 0.5, 0.8, 1.0, 5.0, 4.0, 8.0, 15.0
+    ]).to(device)
+
+    # 如果是 Task 1 或 Task 3，你需要根据它们的类别数调整 weights
+    # 简单的做法是：如果不匹配 task2，就不传 alpha (退化为普通 Focal Loss)
+    if num_classes != 8:
+        print(
+            f"⚠️ Warning: Class weights defined for 8 classes, but current task has {num_classes}. Disabling weighted alpha.")
+        class_weights = None
+
+    logger.info(f"⚖️ Using Focal Loss (gamma=2.0) with weights: {class_weights}")
+    criterion = FocalLoss(alpha=class_weights, gamma=2.0)
+
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2, verbose=True)
+
+    # ... (检查并加载 best_model 的逻辑保持不变)
     best_f1 = 0.0
     patience_counter = 0
     best_model_path = os.path.join(save_dir, 'best_model.pt')
@@ -224,14 +295,11 @@ def main():
             state_dict = torch.load(best_model_path, map_location=device)
             model.load_state_dict(state_dict)
             logger.info("✅ Weights loaded successfully!")
-
-            # 关键步骤：先跑一次验证，确立基准线
             logger.info("📊 Evaluating baseline performance (please wait)...")
             _, _, init_f1 = evaluate(model, dev_loader, criterion, device)
             best_f1 = init_f1
             logger.info(f"🏁 Resuming with Baseline F1: {best_f1:.4f}")
             logger.info("=" * 40 + "\n")
-
         except Exception as e:
             logger.error(f"❌ Error loading checkpoint: {e}")
             logger.info("⚠️ Starting from scratch instead.")
@@ -253,7 +321,7 @@ def main():
 
         scheduler.step(val_f1)
 
-        # Save Best (如果比基准线还好，就覆盖)
+        # Save Best
         if val_f1 > best_f1:
             best_f1 = val_f1
             patience_counter = 0
