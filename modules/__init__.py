@@ -5,6 +5,6 @@ from .encoders import (
     ResNetVisualEncoder,    # <--- 新增
     BERTweetTextEncoder     # <--- 新增
 )
-from .fusion import HGAFusion, BaseFusionModule
+from .fusion import HGAFusion, BaseFusionModule, CGMANFusion
 from .classifier import CrisisKANClassifier  # <--- 新增
 from .model import ModularCrisisModel

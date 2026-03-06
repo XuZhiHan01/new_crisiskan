@@ -40,4 +40,5 @@ TASK_CONFIG = {
 
 # 2. 默认路径配置
 # 假设你的数据还在原来的位置，或者你可以把 datasets 文件夹移动过来
-DEFAULT_DATA_ROOT = '../datasets/CrisisMMD_v2.0'
+#DEFAULT_DATA_ROOT = '../datasets/CrisisMMD_v2.0'
+DEFAULT_DATA_ROOT = '../datasets/settingA'

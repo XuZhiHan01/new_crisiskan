@@ -36,8 +36,8 @@ class CrisisDataset(Dataset):
         # 2. 构建 TSV 文件路径
         # 格式示例: task_humanitarian_text_img_train.tsv
         tsv_name = f"task_{self.task_info['name']}_text_img_{phase}.tsv"
-        self.tsv_path = os.path.join(root_dir, 'crisismmd_datasplit_all', tsv_name)
-
+        self.tsv_path = os.path.join(root_dir,  tsv_name)
+        #'crisismmd_datasplit_all',
         # 3. 读取数据
         self.data_list = self._read_tsv(self.tsv_path)
         print(f"[{phase.upper()}] Loaded {len(self.data_list)} samples from {tsv_name}")
