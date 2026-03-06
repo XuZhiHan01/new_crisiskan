@@ -69,9 +69,12 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--weight_decay', type=float, default=1e-2)
     parser.add_argument('--patience', type=int, default=5)
+    # 🌟 新增：梯度累加步数
+    parser.add_argument('--accumulation_steps', type=int, default=4,
+                        help='梯度累加步数 (实际Batch = batch_size * steps)')
 
     # 🌟 新增：对比损失的权重系数 (论文可做消融实验)
-    parser.add_argument('--lambda_cl', type=float, default=0.1, help='对比损失的权重')
+    parser.add_argument('--lambda_cl', type=float, default=0.05, help='对比损失的权重')
 
     parser.add_argument('--visual_weights', type=str, default='../local_models/resnet50-0676ba61.pth')
     parser.add_argument('--text_model_path', type=str, default='../local_models/vinai/bertweet-base')
@@ -79,7 +82,7 @@ def parse_args():
     parser.add_argument('--embed_dim', type=int, default=256)
     parser.add_argument('--num_heads', type=int, default=4)
     parser.add_argument('--layers', type=int, default=1)
-    parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--dropout', type=float, default=0.3)
 
     return parser.parse_args()
 
@@ -107,36 +110,46 @@ def setup_logger(output_dir):
 # ==========================================
 # 3. 训练循环 (联合优化)
 # ==========================================
-def train_epoch(model, loader, optimizer, criterion_ce, device, epoch, lambda_cl):
+# 🌟 修改：接收 accumulation_steps 参数
+def train_epoch(model, loader, optimizer, criterion_ce, device, epoch, lambda_cl, accumulation_steps):
     model.train()
     total_loss, total_ce, total_cl = 0, 0, 0
     correct, total = 0, 0
 
+    # 🌟 关键 1：在 epoch 开始前清空梯度
+    optimizer.zero_grad()
+
     loop = tqdm(loader, desc=f"Train Epoch {epoch}")
-    for batch in loop:
+    # 🌟 修改：使用 enumerate 获取当前 batch 的索引 i
+    for i, batch in enumerate(loop):
         images = batch['image'].to(device)
         text_inputs = {k: v.to(device) for k, v in batch['text_tokens'].items()}
         labels = batch['label'].to(device)
 
-        optimizer.zero_grad()
         inputs = {'image': images, 'text_tokens': text_inputs}
 
-        # 🌟 关键修改：开启 return_features=True 提取全局特征
         logits, v_global, t_global = model(inputs, return_features=True)
 
-        # 1. 分类损失 (Cross Entropy)
+        # 1. 计算各项损失
         loss_ce = criterion_ce(logits, labels)
-
-        # 2. 对比损失 (Contrastive Loss)
         loss_cl = contrastive_loss(v_global, t_global)
 
-        # 3. 联合损失 (Joint Loss)
+        # 2. 联合损失
         loss = loss_ce + lambda_cl * loss_cl
 
-        loss.backward()
-        optimizer.step()
+        # 🌟 关键 2：将 loss 除以累加步数，保证梯度的数学期望一致
+        loss = loss / accumulation_steps
 
-        total_loss += loss.item()
+        # 3. 反向传播 (累加梯度，但先不更新权重)
+        loss.backward()
+
+        # 🌟 关键 3：只有当达到累加步数，或者到了最后一个 batch 时，才真正更新权重并清空梯度
+        if (i + 1) % accumulation_steps == 0 or (i + 1) == len(loader):
+            optimizer.step()
+            optimizer.zero_grad()
+
+        # 统计指标 (注意把 loss 乘回来，以免打印出的数值偏小造成误解)
+        total_loss += loss.item() * accumulation_steps
         total_ce += loss_ce.item()
         total_cl += loss_cl.item()
 
@@ -144,10 +157,15 @@ def train_epoch(model, loader, optimizer, criterion_ce, device, epoch, lambda_cl
         correct += (preds == labels).sum().item()
         total += labels.size(0)
 
-        loop.set_postfix(loss=loss.item(), ce=loss_ce.item(), cl=loss_cl.item(), acc=correct / total)
+        # 进度条显示当前的真实 loss
+        loop.set_postfix(
+            loss=loss.item() * accumulation_steps,
+            ce=loss_ce.item(),
+            cl=loss_cl.item(),
+            acc=correct / total
+        )
 
     return total_loss / len(loader), correct / total
-
 
 def evaluate(model, loader, criterion_ce, device, lambda_cl):
     model.eval()
@@ -275,7 +293,10 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         # 传入 lambda_cl 控制对比损失占比
-        train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion_ce, device, epoch, args.lambda_cl)
+        train_loss, train_acc = train_epoch(
+            model, train_loader, optimizer, criterion_ce, device, epoch,
+            args.lambda_cl, args.accumulation_steps
+        )
         logger.info(f"[Epoch {epoch}] Train Total Loss: {train_loss:.4f} | Acc: {train_acc:.4f}")
 
         val_loss, val_acc, val_f1 = evaluate(model, dev_loader, criterion_ce, device, args.lambda_cl)
