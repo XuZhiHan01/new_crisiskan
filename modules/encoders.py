@@ -6,7 +6,10 @@ import torch.nn.functional as F
 import torchvision.models as models
 from transformers import ElectraModel, ElectraConfig
 from collections import OrderedDict
-from transformers import AutoModel, AutoConfig
+from transformers import AutoModel, AutoConfig, AutoTokenizer
+import timm
+
+
 
 # ==========================================
 # 1. 定义基类
@@ -186,3 +189,48 @@ class BERTweetTextEncoder(BaseTextEncoder):
         # 获取序列特征 (B, Seq_Len, 768)
         last_hidden_state = outputs.last_hidden_state
         return self.dropout(last_hidden_state)
+
+
+
+# ==========================================
+# 🚀 现代化视觉编码器: ConvNeXt-V2 (完全纯本地离线版)
+# ==========================================
+class ConvNextVisualEncoder(nn.Module):
+    def __init__(self, weights_path='../local_models/convnextv2_base/model.safetensors'):
+        super().__init__()
+        # pretrained=False 阻止它去网上下载，checkpoint_path 强制加载本地权重
+        self.backbone = timm.create_model(
+            'convnextv2_base.fcmae_ft_in22k_in1k',
+            pretrained=False,
+            num_classes=0,
+            checkpoint_path=weights_path
+        )
+        self.output_dim = self.backbone.num_features # 通常是 1024
+
+    def forward(self, x):
+        # 提取空间特征图 (B, 1024, 7, 7)
+        features = self.backbone.forward_features(x)
+        # 展平空间维度 (B, 49, 1024)，完美对接你的 C-GMAN Fusion
+        features = features.flatten(2).transpose(1, 2)
+        return features
+
+
+# ==========================================
+# 🚀 现代化文本编码器: DeBERTa-V3 (完全纯本地离线版)
+# ==========================================
+class DebertaTextEncoder(nn.Module):
+    def __init__(self, model_path='../local_models/deberta-v3-base'):
+        super().__init__()
+        # 直接传入本地文件夹路径
+        self.backbone = AutoModel.from_pretrained(model_path)
+        self.output_dim = self.backbone.config.hidden_size # 通常是 768
+
+    def forward(self, input_ids, attention_mask=None, **kwargs):
+        outputs = self.backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True
+        )
+        # 获取 Token 序列 (B, Seq_Len, 768)
+        sequence_output = outputs.last_hidden_state
+        return sequence_output

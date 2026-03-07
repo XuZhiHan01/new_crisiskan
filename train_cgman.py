@@ -20,6 +20,8 @@ from data import CrisisDataset, TextProcessor, get_transforms, DEFAULT_DATA_ROOT
 from modules import (
     ResNetVisualEncoder,
     BERTweetTextEncoder,
+    ConvNextVisualEncoder,
+    DebertaTextEncoder,
     CGMANFusion,  # <--- 引入新的 C-GMAN 融合模块
     CrisisKANClassifier,
     ModularCrisisModel
@@ -77,8 +79,8 @@ def parse_args():
     parser.add_argument('--lambda_cl', type=float, default=0.05, help='对比损失的权重')
 
     parser.add_argument('--visual_weights', type=str, default='../local_models/resnet50-0676ba61.pth')
-    parser.add_argument('--text_model_path', type=str, default='../local_models/vinai/bertweet-base')
-
+    # 指向你刚刚下载的 DeBERTa 本地文件夹
+    parser.add_argument('--text_model_path', type=str, default='../local_models/deberta-v3-base')
     parser.add_argument('--embed_dim', type=int, default=256)
     parser.add_argument('--num_heads', type=int, default=4)
     parser.add_argument('--layers', type=int, default=1)
@@ -228,10 +230,8 @@ def main():
 
     # 组装 C-GMAN 模型
     logger.info("🏗️ Assembling C-GMAN Components...")
-    vis_weight = args.visual_weights if os.path.exists(args.visual_weights) else None
-    vis_enc = ResNetVisualEncoder(weights_path=vis_weight, pretrained=True)
-    txt_enc = BERTweetTextEncoder(model_path=args.text_model_path)
-
+    vis_enc = ConvNextVisualEncoder()
+    txt_enc = DebertaTextEncoder(model_path=args.text_model_path)
     # 🌟 关键修改：使用 CGMANFusion
     fusion = CGMANFusion(
         visual_dim=vis_enc.output_dim,
@@ -259,8 +259,8 @@ def main():
         {'params': pretrained_params, 'lr': args.lr},  # 例如: 1e-5 (保持微调步调)
         {'params': fresh_params, 'lr': args.lr * 10.0}  # 例如: 1e-4 (加速融合层收敛)
     ], weight_decay=args.weight_decay)
-    criterion_ce = nn.CrossEntropyLoss()
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2, verbose=True)
+    criterion_ce = nn.CrossEntropyLoss(label_smoothing=0.1)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
     best_f1 = 0.0
     patience_counter = 0
@@ -302,7 +302,7 @@ def main():
         val_loss, val_acc, val_f1 = evaluate(model, dev_loader, criterion_ce, device, args.lambda_cl)
         logger.info(f"[Epoch {epoch}] Val Total Loss: {val_loss:.4f} | Acc: {val_acc:.4f} | F1: {val_f1:.4f}")
 
-        scheduler.step(val_f1)
+        scheduler.step()
 
         if val_f1 > best_f1:
             best_f1 = val_f1

@@ -18,7 +18,9 @@ from modules import (
     BERTweetTextEncoder,
     CGMANFusion,          # <--- 关键：使用 C-GMAN 融合
     CrisisKANClassifier,
-    ModularCrisisModel
+    ModularCrisisModel,
+    ConvNextVisualEncoder,
+    DebertaTextEncoder
 )
 
 def parse_args():
@@ -37,7 +39,7 @@ def parse_args():
     parser.add_argument('--output_dir', type=str, default='./test_results_cgman')
 
     # --- 文本模型路径 ---
-    parser.add_argument('--text_model_path', type=str, default='../local_models/vinai/bertweet-base')
+    parser.add_argument('--text_model_path', type=str, default='../local_models/deberta-v3-base')
 
     # --- 模型结构参数 (必须与 train_cgman.py 保持完全一致！) ---
     parser.add_argument('--embed_dim', type=int, default=256)
@@ -65,7 +67,16 @@ def run_test(model, loader, device):
             inputs = {'image': images, 'text_tokens': text_inputs}
 
             # 这里的推理，不需要 return_features=True，因为只做预测
-            logits = model(inputs)
+            logits_normal = model(inputs)
+
+            # 🌟 黑科技：2. 图像水平翻转后再推理一次
+            flipped_images = torch.flip(images, dims=[3])  # 沿宽度维度翻转
+            inputs_flipped = {'image': flipped_images, 'text_tokens': text_inputs}
+            logits_flipped = model(inputs_flipped)
+
+            # 🌟 3. 取两次预测的平均值作为最终决定
+            logits = (logits_normal + logits_flipped) / 2.0
+
             preds = torch.argmax(logits, dim=1)
 
             all_preds.extend(preds.cpu().numpy())
@@ -94,9 +105,8 @@ def main():
 
     # 2. 组装 C-GMAN 模型
     print("🏗️ Re-building C-GMAN Architecture...")
-    vis_enc = ResNetVisualEncoder(weights_path=None, pretrained=False)
-    txt_enc = BERTweetTextEncoder(model_path=args.text_model_path)
-
+    vis_enc = ConvNextVisualEncoder()
+    txt_enc = DebertaTextEncoder(model_path=args.text_model_path)
     fusion = CGMANFusion(
         visual_dim=vis_enc.output_dim,
         text_dim=txt_enc.output_dim,

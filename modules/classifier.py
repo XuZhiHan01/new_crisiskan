@@ -13,28 +13,18 @@ class BaseClassifier(nn.Module):
         raise NotImplementedError
 
 
-class CrisisKANClassifier(BaseClassifier):
-    def __init__(self, input_dim, num_classes=2, dropout_rate=0.1):
-        """
-        Args:
-            input_dim: 输入特征维度 (例如 200)
-            num_classes: 分类数量 (例如 2 或 8)
-        """
-        super().__init__(input_dim, num_classes)
-
-        # 1. 额外的全连接层 (模拟原论文的 fc_as_self_attn)
-        self.fc_layers = nn.Sequential(
-            nn.Linear(input_dim, input_dim),
-            nn.BatchNorm1d(input_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate)
-        )
-
-        # 2. 最终分类层
-        self.cls_layer = nn.Linear(input_dim, num_classes)
+class CrisisKANClassifier(nn.Module):
+    def __init__(self, input_dim, num_classes, dropout_rate=0.15):
+        super().__init__()
+        # 🌟 黑科技：创建 5 个不同的 Dropout 层
+        self.dropouts = nn.ModuleList([nn.Dropout(dropout_rate) for _ in range(5)])
+        self.fc = nn.Linear(input_dim, num_classes)
 
     def forward(self, x):
-        # x: (B, input_dim)
-        feat = self.fc_layers(x)
-        logits = self.cls_layer(feat)
-        return logits
+        # 🌟 5个分支分别推断，最后求平均。代码极短，但泛化能力飙升
+        for i, dropout in enumerate(self.dropouts):
+            if i == 0:
+                out = self.fc(dropout(x))
+            else:
+                out += self.fc(dropout(x))
+        return out / len(self.dropouts)
