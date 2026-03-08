@@ -12,7 +12,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, f1_score
-
+from transformers import get_cosine_schedule_with_warmup
 # 导入通用组件
 from data import CrisisDataset, TextProcessor, get_transforms, DEFAULT_DATA_ROOT, TASK_CONFIG
 
@@ -64,15 +64,15 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=42)
 
     parser.add_argument('--data_root', type=str, default=DEFAULT_DATA_ROOT)
-    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--batch_size', type=int, default=12)
     parser.add_argument('--num_workers', type=int, default=4)
 
     parser.add_argument('--epochs', type=int, default=20)
-    parser.add_argument('--lr', type=float, default=1e-5)
+    parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-2)
     parser.add_argument('--patience', type=int, default=5)
     # 🌟 新增：梯度累加步数
-    parser.add_argument('--accumulation_steps', type=int, default=4,
+    parser.add_argument('--accumulation_steps', type=int, default=6,
                         help='梯度累加步数 (实际Batch = batch_size * steps)')
 
     # 🌟 新增：对比损失的权重系数 (论文可做消融实验)
@@ -113,7 +113,8 @@ def setup_logger(output_dir):
 # 3. 训练循环 (联合优化)
 # ==========================================
 # 🌟 修改：接收 accumulation_steps 参数
-def train_epoch(model, loader, optimizer, criterion_ce, device, epoch, lambda_cl, accumulation_steps):
+def train_epoch(model, loader, optimizer, criterion_ce, device, epoch,
+                lambda_cl, accumulation_steps, scheduler, scaler):
     model.train()
     total_loss, total_ce, total_cl = 0, 0, 0
     correct, total = 0, 0
@@ -130,24 +131,27 @@ def train_epoch(model, loader, optimizer, criterion_ce, device, epoch, lambda_cl
 
         inputs = {'image': images, 'text_tokens': text_inputs}
 
-        logits, v_global, t_global = model(inputs, return_features=True)
+        # 🌟 关键修改 1：开启 autocast 混合精度上下文
+        with torch.cuda.amp.autocast():
+            logits, v_global, t_global = model(inputs, return_features=True)
+            loss_ce = criterion_ce(logits, labels)
+            loss_cl = contrastive_loss(v_global, t_global)
+            loss = loss_ce + lambda_cl * loss_cl
+            loss = loss / accumulation_steps
 
-        # 1. 计算各项损失
-        loss_ce = criterion_ce(logits, labels)
-        loss_cl = contrastive_loss(v_global, t_global)
-
-        # 2. 联合损失
-        loss = loss_ce + lambda_cl * loss_cl
-
-        # 🌟 关键 2：将 loss 除以累加步数，保证梯度的数学期望一致
-        loss = loss / accumulation_steps
-
-        # 3. 反向传播 (累加梯度，但先不更新权重)
-        loss.backward()
+        # 🌟 关键修改 2：使用 scaler 放大 loss 并反向传播
+        scaler.scale(loss).backward()
 
         # 🌟 关键 3：只有当达到累加步数，或者到了最后一个 batch 时，才真正更新权重并清空梯度
         if (i + 1) % accumulation_steps == 0 or (i + 1) == len(loader):
-            optimizer.step()
+            # 🌟 关键修改 3：在裁剪梯度前，必须先 unscale
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            # 🌟 关键修改 4：使用 scaler 步进优化器
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
             optimizer.zero_grad()
 
         # 统计指标 (注意把 loss 乘回来，以免打印出的数值偏小造成误解)
@@ -256,11 +260,23 @@ def main():
     fresh_params = list(model.fusion_module.parameters()) + list(model.classifier.parameters())
 
     optimizer = optim.AdamW([
-        {'params': pretrained_params, 'lr': args.lr},  # 例如: 1e-5 (保持微调步调)
-        {'params': fresh_params, 'lr': args.lr * 10.0}  # 例如: 1e-4 (加速融合层收敛)
+        {'params': pretrained_params, 'lr': 5e-6},  # 例如: 1e-5 (保持微调步调)
+        {'params': fresh_params, 'lr': args.lr }  # 例如: 1e-4 (加速融合层收敛)
     ], weight_decay=args.weight_decay)
     criterion_ce = nn.CrossEntropyLoss(label_smoothing=0.1)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    # 计算总步数 (Total steps)
+    total_steps = len(train_loader) // args.accumulation_steps * args.epochs
+    # 预热步数设为总步数的 10%
+    warmup_steps = int(total_steps * 0.1)
+
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps
+    )
+
+    # 🌟 新增：混合精度梯度缩放器
+    scaler = torch.cuda.amp.GradScaler()
 
     best_f1 = 0.0
     patience_counter = 0
@@ -295,14 +311,14 @@ def main():
         # 传入 lambda_cl 控制对比损失占比
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, criterion_ce, device, epoch,
-            args.lambda_cl, args.accumulation_steps
+            args.lambda_cl, args.accumulation_steps, scheduler, scaler
         )
         logger.info(f"[Epoch {epoch}] Train Total Loss: {train_loss:.4f} | Acc: {train_acc:.4f}")
 
         val_loss, val_acc, val_f1 = evaluate(model, dev_loader, criterion_ce, device, args.lambda_cl)
         logger.info(f"[Epoch {epoch}] Val Total Loss: {val_loss:.4f} | Acc: {val_acc:.4f} | F1: {val_f1:.4f}")
 
-        scheduler.step()
+
 
         if val_f1 > best_f1:
             best_f1 = val_f1

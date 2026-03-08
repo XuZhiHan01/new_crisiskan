@@ -1,5 +1,7 @@
 # modules/encoders.py
+import os
 
+import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,7 +9,7 @@ import torchvision.models as models
 from transformers import ElectraModel, ElectraConfig
 from collections import OrderedDict
 from transformers import AutoModel, AutoConfig, AutoTokenizer
-import timm
+from timm.models import load_checkpoint
 
 
 
@@ -198,14 +200,23 @@ class BERTweetTextEncoder(BaseTextEncoder):
 class ConvNextVisualEncoder(nn.Module):
     def __init__(self, weights_path='../local_models/convnextv2_base/model.safetensors'):
         super().__init__()
-        # pretrained=False 阻止它去网上下载，checkpoint_path 强制加载本地权重
+
+        # 1. 创建模型结构，去掉分类头 (num_classes=0)
+        # 注意：这里去掉了 checkpoint_path 参数
         self.backbone = timm.create_model(
             'convnextv2_base.fcmae_ft_in22k_in1k',
             pretrained=False,
-            num_classes=0,
-            checkpoint_path=weights_path
+            num_classes=0
         )
-        self.output_dim = self.backbone.num_features # 通常是 1024
+
+        # 2. 手动加载本地权重，并设置 strict=False 忽略多余的分类头
+        if weights_path and os.path.exists(weights_path):
+            print(f"📥 Loading local visual weights from {weights_path}")
+            load_checkpoint(self.backbone, weights_path, strict=False)
+        else:
+            print("⚠️ Warning: 找不到本地视觉权重，将使用随机初始化！请检查路径。")
+
+        self.output_dim = self.backbone.num_features  # 通常是 1024
 
     def forward(self, x):
         # 提取空间特征图 (B, 1024, 7, 7)
@@ -215,8 +226,7 @@ class ConvNextVisualEncoder(nn.Module):
         return features
 
 
-# ==========================================
-# 🚀 现代化文本编码器: DeBERTa-V3 (完全纯本地离线版)
+# 🚀 现代化文本编码器: DeBERTa-V3 (纯本地离线版)
 # ==========================================
 class DebertaTextEncoder(nn.Module):
     def __init__(self, model_path='../local_models/deberta-v3-base'):
@@ -225,7 +235,11 @@ class DebertaTextEncoder(nn.Module):
         self.backbone = AutoModel.from_pretrained(model_path)
         self.output_dim = self.backbone.config.hidden_size # 通常是 768
 
-    def forward(self, input_ids, attention_mask=None, **kwargs):
+    def forward(self, text_tokens):
+        # 🌟 关键修改：接收字典 text_tokens，并从中提取 input_ids 和 attention_mask
+        input_ids = text_tokens['input_ids']
+        attention_mask = text_tokens.get('attention_mask', None)
+
         outputs = self.backbone(
             input_ids=input_ids,
             attention_mask=attention_mask,
