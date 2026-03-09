@@ -59,7 +59,7 @@ def contrastive_loss(v_feat, t_feat, temperature=0.07):
 def parse_args():
     parser = argparse.ArgumentParser(description="Train C-GMAN Model")
     parser.add_argument('--task_name', type=str, default='task1', choices=['task1', 'task2', 'task3'])
-    parser.add_argument('--run_name', type=str, default='cgman_resnet_bertweet_exp', help='实验名称')
+    parser.add_argument('--run_name', type=str, default='cgman_resnet_bertweet_exp02', help='实验名称')
     parser.add_argument('--output_dir', type=str, default='./output_cgman', help='保存路径')
     parser.add_argument('--seed', type=int, default=42)
 
@@ -72,7 +72,7 @@ def parse_args():
     parser.add_argument('--weight_decay', type=float, default=1e-2)
     parser.add_argument('--patience', type=int, default=5)
     # 🌟 新增：梯度累加步数
-    parser.add_argument('--accumulation_steps', type=int, default=6,
+    parser.add_argument('--accumulation_steps', type=int, default=8,
                         help='梯度累加步数 (实际Batch = batch_size * steps)')
 
     # 🌟 新增：对比损失的权重系数 (论文可做消融实验)
@@ -263,7 +263,7 @@ def main():
         {'params': pretrained_params, 'lr': 5e-6},  # 例如: 1e-5 (保持微调步调)
         {'params': fresh_params, 'lr': args.lr }  # 例如: 1e-4 (加速融合层收敛)
     ], weight_decay=args.weight_decay)
-    criterion_ce = nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion_ce = nn.CrossEntropyLoss(label_smoothing=0.05)
     # 计算总步数 (Total steps)
     total_steps = len(train_loader) // args.accumulation_steps * args.epochs
     # 预热步数设为总步数的 10%

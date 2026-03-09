@@ -34,7 +34,7 @@ def parse_args():
 
     # --- 关键：模型路径 (请修改为你训练时 run_name 生成的目录) ---
     parser.add_argument('--checkpoint_path', type=str,
-                        default='./output_cgman/task1/cgman_resnet_bertweet_exp/best_model.pt',
+                        default='./output_cgman/task1/cgman_resnet_bertweet_exp02/best_model.pt',
                         help='训练好的 best_model.pt 路径')
     parser.add_argument('--output_dir', type=str, default='./test_results_cgman')
 
@@ -45,7 +45,7 @@ def parse_args():
     parser.add_argument('--embed_dim', type=int, default=256)
     parser.add_argument('--num_heads', type=int, default=4)
     parser.add_argument('--layers', type=int, default=1)
-    parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--dropout', type=float, default=0.3)
 
     return parser.parse_args()
 
