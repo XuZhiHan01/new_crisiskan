@@ -27,16 +27,17 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Test C-GMAN (Contrastive-Guided Gated Network)")
 
     # --- 基础配置 ---
-    parser.add_argument('--task_name', type=str, default='task1', choices=['task1', 'task2', 'task3'])
+    parser.add_argument('--task_name', type=str, default='task3', choices=['task1', 'task2', 'task3'])
+    # --- 关键：模型路径 (请修改为你训练时 run_name 生成的目录) ---
+    parser.add_argument('--checkpoint_path', type=str,
+                        default='./output_cgman/task3/task3_lamda_0.2/best_model.pt',
+                        help='训练好的 best_model.pt 路径')
+    parser.add_argument('--output_dir', type=str, default='./test_results_cgman')
+
     parser.add_argument('--data_root', type=str, default=DEFAULT_DATA_ROOT)
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--num_workers', type=int, default=4)
 
-    # --- 关键：模型路径 (请修改为你训练时 run_name 生成的目录) ---
-    parser.add_argument('--checkpoint_path', type=str,
-                        default='./output_cgman/task1/cgman_resnet_bertweet_exp02/best_model.pt',
-                        help='训练好的 best_model.pt 路径')
-    parser.add_argument('--output_dir', type=str, default='./test_results_cgman')
 
     # --- 文本模型路径 ---
     parser.add_argument('--text_model_path', type=str, default='../local_models/deberta-v3-base')
@@ -45,7 +46,7 @@ def parse_args():
     parser.add_argument('--embed_dim', type=int, default=256)
     parser.add_argument('--num_heads', type=int, default=4)
     parser.add_argument('--layers', type=int, default=1)
-    parser.add_argument('--dropout', type=float, default=0.3)
+    parser.add_argument('--dropout', type=float, default=0.4)
 
     return parser.parse_args()
 
@@ -121,7 +122,9 @@ def main():
         dropout_rate=args.dropout
     )
 
-    model = ModularCrisisModel(vis_enc, txt_enc, fusion, cls_head)
+    # ✅ 新的组装方式：传入 num_classes 和 embed_dim 以激活辅助头，使模型结构与权重文件完美匹配
+    model = ModularCrisisModel(vis_enc, txt_enc, fusion, cls_head,
+                               num_classes=num_classes, embed_dim=args.embed_dim)
     model.to(device)
 
     # 3. 加载权重
@@ -145,8 +148,8 @@ def main():
 
     # 将报告内容拼装成字符串，方便既打印到屏幕，又写入文件
     report_str = f"Accuracy:    {acc:.4f}\n"
-    report_str += f"Weighted F1: {weighted_f1:.4f}\n"
     report_str += f"Macro F1:    {macro_f1:.4f}\n"
+    report_str += f"Weighted F1: {weighted_f1:.4f}\n"
     report_str += "-" * 50 + "\n"
     report_str += classification_report(true_labels, pred_labels, labels=list(range(num_classes)),
                                         target_names=target_names, digits=4)

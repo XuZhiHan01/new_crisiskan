@@ -62,6 +62,6 @@ if __name__ == '__main__':
     dataset_path = '/home/tSdu/xzh/crisisKAN/crisiskan/datasets/settingA/'
 
     # 设置超参数：你想从测试集中抽出多少比例放到训练集里 (例如 0.15 代表 15%)
-    RATIO_TO_MOVE = 0.70
+    RATIO_TO_MOVE = 0.58
 
     process_datasets(dataset_path, RATIO_TO_MOVE)

@@ -170,11 +170,18 @@ class CGMANFusion(BaseFusionModule):
         v_intra = self.vis_self_attn(v_embed)  # (B, 49, 256)
         t_intra = self.txt_self_attn(t_embed)  # (B, Seq, 256)
 
+        #v_fused = self.img2text_cross_attn(tgt=v_embed, memory=t_embed)  # (B, 49, 256)
+        # Tgt=Text, Memory=Image -> Text 寻找相关的 Image
+        #t_fused = self.text2img_cross_attn(tgt=t_embed, memory=v_embed)
         # 3. 跨模态双向注意力
         # Tgt=Image, Memory=Text -> Image 寻找相关的 Text
         v_fused = self.img2text_cross_attn(tgt=v_intra, memory=t_intra)  # (B, 49, 256)
         # Tgt=Text, Memory=Image -> Text 寻找相关的 Image
         t_fused = self.text2img_cross_attn(tgt=t_intra, memory=v_intra)  # (B, Seq, 256)
+
+        # 【消融跨模态】：直接把模态内自注意力的结果送去 Pooling
+        #v_fused = v_intra
+        #t_fused = t_intra
 
         # 4. 序列池化降维
         v_pool = self.vis_pooling(v_fused)  # (B, 256)
@@ -189,6 +196,6 @@ class CGMANFusion(BaseFusionModule):
 
         # 最终门控融合：动态选择更值得信任的模态
         final_fused_feat = alpha * t_pool + beta * v_pool  # (B, 256)
-
+        #final_fused_feat = (t_pool + v_pool) / 2.0  # (B, 256)
         # 返回融合后的特征，以及全局特征(用于计算辅助Loss)
         return final_fused_feat, v_global, t_global

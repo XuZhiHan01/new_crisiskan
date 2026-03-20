@@ -28,55 +28,31 @@ from modules import (
 )
 
 
-# ==========================================
-# 🌟 新增：跨模态对比损失函数 (InfoNCE) 🌟
-# ==========================================
-def contrastive_loss(v_feat, t_feat, temperature=0.07):
-    """
-    计算图像全局特征和文本全局特征的对比损失。
-    这在论文中可以大书特书：Semantic-Anchored Contrastive Pre-alignment
-    """
-    # 1. 特征 L2 归一化
-    v_feat = F.normalize(v_feat, dim=-1)
-    t_feat = F.normalize(t_feat, dim=-1)
-
-    # 2. 计算余弦相似度矩阵 (B, B)
-    logits = torch.matmul(v_feat, t_feat.T) / temperature
-
-    # 3. 构建目标标签 (对角线上的元素互为正样本)
-    labels = torch.arange(logits.size(0), device=logits.device)
-
-    # 4. 对称交叉熵 (Image2Text 和 Text2Image)
-    loss_i2t = F.cross_entropy(logits, labels)
-    loss_t2i = F.cross_entropy(logits.T, labels)
-
-    return (loss_i2t + loss_t2i) / 2.0
-
 
 # ==========================================
 # 1. 参数配置
 # ==========================================
 def parse_args():
     parser = argparse.ArgumentParser(description="Train C-GMAN Model")
-    parser.add_argument('--task_name', type=str, default='task1', choices=['task1', 'task2', 'task3'])
-    parser.add_argument('--run_name', type=str, default='cgman_resnet_bertweet_exp02', help='实验名称')
+    parser.add_argument('--task_name', type=str, default='task3', choices=['task1', 'task2', 'task3'])
+    parser.add_argument('--run_name', type=str, default='task3_lamda_0.2', help='实验名称')
     parser.add_argument('--output_dir', type=str, default='./output_cgman', help='保存路径')
     parser.add_argument('--seed', type=int, default=42)
 
     parser.add_argument('--data_root', type=str, default=DEFAULT_DATA_ROOT)
-    parser.add_argument('--batch_size', type=int, default=12)
+    parser.add_argument('--batch_size', type=int, default=10)
     parser.add_argument('--num_workers', type=int, default=4)
 
     parser.add_argument('--epochs', type=int, default=20)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--weight_decay', type=float, default=1e-2)
-    parser.add_argument('--patience', type=int, default=5)
+    parser.add_argument('--lr', type=float, default=3e-5)
+    parser.add_argument('--weight_decay', type=float, default=0.05)
+    parser.add_argument('--patience', type=int, default=2)
     # 🌟 新增：梯度累加步数
     parser.add_argument('--accumulation_steps', type=int, default=8,
                         help='梯度累加步数 (实际Batch = batch_size * steps)')
 
     # 🌟 新增：对比损失的权重系数 (论文可做消融实验)
-    parser.add_argument('--lambda_cl', type=float, default=0.05, help='对比损失的权重')
+    parser.add_argument('--lambda_cl', type=float, default=0.15, help='对比损失的权重')
 
     parser.add_argument('--visual_weights', type=str, default='../local_models/resnet50-0676ba61.pth')
     # 指向你刚刚下载的 DeBERTa 本地文件夹
@@ -84,7 +60,7 @@ def parse_args():
     parser.add_argument('--embed_dim', type=int, default=256)
     parser.add_argument('--num_heads', type=int, default=4)
     parser.add_argument('--layers', type=int, default=1)
-    parser.add_argument('--dropout', type=float, default=0.3)
+    parser.add_argument('--dropout', type=float, default=0.4)
 
     return parser.parse_args()
 
@@ -133,9 +109,21 @@ def train_epoch(model, loader, optimizer, criterion_ce, device, epoch,
 
         # 🌟 关键修改 1：开启 autocast 混合精度上下文
         with torch.cuda.amp.autocast():
-            logits, v_global, t_global = model(inputs, return_features=True)
+            # 1. 接收主分类预测(logits)和两个辅助分类预测(aux_v_logits, aux_t_logits)
+            logits, aux_v_logits, aux_t_logits = model(inputs, return_features=True)
+
+            # 2. 计算主分支的交叉熵损失 (这是融合后最终的预测)
             loss_ce = criterion_ce(logits, labels)
-            loss_cl = contrastive_loss(v_global, t_global)
+
+            # 3. 计算视觉和文本单模态的独立交叉熵损失 (防止模态偷懒)
+            loss_aux_v = criterion_ce(aux_v_logits, labels)
+            loss_aux_t = criterion_ce(aux_t_logits, labels)
+
+            # 4. 把两个辅助损失加起来。
+            # (💡 技巧：这里我故意继续用 loss_cl 这个变量名，这样你下面打印 tqdm 进度条的代码 total_cl += loss_cl.item() 就一行都不用改了！)
+            loss_cl = loss_aux_v + loss_aux_t
+
+            # 5. 联合损失加权：主损失 + λ * (视觉辅助 + 文本辅助)
             loss = loss_ce + lambda_cl * loss_cl
             loss = loss / accumulation_steps
 
@@ -186,10 +174,17 @@ def evaluate(model, loader, criterion_ce, device, lambda_cl):
             labels = batch['label'].to(device)
 
             inputs = {'image': images, 'text_tokens': text_inputs}
-            logits, v_global, t_global = model(inputs, return_features=True)
 
+            # 1. 同样地，解包出三个预测值
+            logits, aux_v_logits, aux_t_logits = model(inputs, return_features=True)
+
+            # 2. 计算三个独立的交叉熵损失
             loss_ce = criterion_ce(logits, labels)
-            loss_cl = contrastive_loss(v_global, t_global)
+            loss_aux_v = criterion_ce(aux_v_logits, labels)
+            loss_aux_t = criterion_ce(aux_t_logits, labels)
+
+            # 3. 组合联合损失
+            loss_cl = loss_aux_v + loss_aux_t
             loss = loss_ce + lambda_cl * loss_cl
 
             total_loss += loss.item()
@@ -215,7 +210,7 @@ def main():
     logger = setup_logger(save_dir)
     logger.info(f"🚀 Starting C-GMAN (Contrastive-Guided Gated Network): {args.run_name}")
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
     logger.info(f"⚙️ Device: {device}")
 
     # 数据准备
@@ -251,17 +246,21 @@ def main():
         dropout_rate=args.dropout
     )
 
-    model = ModularCrisisModel(vis_enc, txt_enc, fusion, cls_head)
+    model = ModularCrisisModel(vis_enc, txt_enc, fusion, cls_head,
+                               num_classes=num_classes, embed_dim=args.embed_dim)
     model.to(device)
 
     # 优化器
     # 区分预训练模块和随机初始化模块
+    # 🌟 修改 2：把辅助分类头的参数加入到 fresh_params 中，让它们能被更新
     pretrained_params = list(model.visual_encoder.parameters()) + list(model.text_encoder.parameters())
     fresh_params = list(model.fusion_module.parameters()) + list(model.classifier.parameters())
+    if hasattr(model, 'aux_vis_head') and model.aux_vis_head is not None:
+        fresh_params += list(model.aux_vis_head.parameters()) + list(model.aux_txt_head.parameters())
 
     optimizer = optim.AdamW([
-        {'params': pretrained_params, 'lr': 5e-6},  # 例如: 1e-5 (保持微调步调)
-        {'params': fresh_params, 'lr': args.lr }  # 例如: 1e-4 (加速融合层收敛)
+        {'params': pretrained_params, 'lr': 5e-6},
+        {'params': fresh_params, 'lr': args.lr}
     ], weight_decay=args.weight_decay)
     criterion_ce = nn.CrossEntropyLoss(label_smoothing=0.05)
     # 计算总步数 (Total steps)
