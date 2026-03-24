@@ -162,7 +162,7 @@ class CGMANFusion(BaseFusionModule):
         v_embed = self.vis_proj(visual_feats)  # (B, 49, 256)
         t_embed = self.text_proj(text_feats)  # (B, Seq, 256)
 
-        # [关键前置操作] 提取出全局特征，留给外面计算 对比损失(Contrastive Loss) 用
+        # [关键前置操作] 提取出全局特征，提取出单模态全局特征，留给外面进行 深层监督(辅助分类) 用
         v_global = v_embed.mean(dim=1)  # 图像全局均值池化 (B, 256)
         t_global = t_embed[:, 0, :]  # 文本取 [CLS] token (B, 256)
 

@@ -52,7 +52,7 @@ def parse_args():
                         help='梯度累加步数 (实际Batch = batch_size * steps)')
 
     # 🌟 新增：对比损失的权重系数 (论文可做消融实验)
-    parser.add_argument('--lambda_cl', type=float, default=0.15, help='对比损失的权重')
+    parser.add_argument('--lambda_aux', type=float, default=0.15, help='对比损失的权重')
 
     parser.add_argument('--visual_weights', type=str, default='../local_models/resnet50-0676ba61.pth')
     # 指向你刚刚下载的 DeBERTa 本地文件夹
@@ -90,7 +90,7 @@ def setup_logger(output_dir):
 # ==========================================
 # 🌟 修改：接收 accumulation_steps 参数
 def train_epoch(model, loader, optimizer, criterion_ce, device, epoch,
-                lambda_cl, accumulation_steps, scheduler, scaler):
+                lambda_aux, accumulation_steps, scheduler, scaler):
     model.train()
     total_loss, total_ce, total_cl = 0, 0, 0
     correct, total = 0, 0
@@ -120,11 +120,11 @@ def train_epoch(model, loader, optimizer, criterion_ce, device, epoch,
             loss_aux_t = criterion_ce(aux_t_logits, labels)
 
             # 4. 把两个辅助损失加起来。
-            # (💡 技巧：这里我故意继续用 loss_cl 这个变量名，这样你下面打印 tqdm 进度条的代码 total_cl += loss_cl.item() 就一行都不用改了！)
-            loss_cl = loss_aux_v + loss_aux_t
+            # (💡 技巧：这里我故意继续用 loss_aux 这个变量名，这样你下面打印 tqdm 进度条的代码 total_cl += loss_aux.item() 就一行都不用改了！)
+            loss_aux = loss_aux_v + loss_aux_t
 
             # 5. 联合损失加权：主损失 + λ * (视觉辅助 + 文本辅助)
-            loss = loss_ce + lambda_cl * loss_cl
+            loss = loss_ce + lambda_aux * loss_aux
             loss = loss / accumulation_steps
 
         # 🌟 关键修改 2：使用 scaler 放大 loss 并反向传播
@@ -145,7 +145,7 @@ def train_epoch(model, loader, optimizer, criterion_ce, device, epoch,
         # 统计指标 (注意把 loss 乘回来，以免打印出的数值偏小造成误解)
         total_loss += loss.item() * accumulation_steps
         total_ce += loss_ce.item()
-        total_cl += loss_cl.item()
+        total_cl += loss_aux.item()
 
         preds = torch.argmax(logits, dim=1)
         correct += (preds == labels).sum().item()
@@ -155,13 +155,13 @@ def train_epoch(model, loader, optimizer, criterion_ce, device, epoch,
         loop.set_postfix(
             loss=loss.item() * accumulation_steps,
             ce=loss_ce.item(),
-            cl=loss_cl.item(),
+            aux=loss_aux.item(),
             acc=correct / total
         )
 
     return total_loss / len(loader), correct / total
 
-def evaluate(model, loader, criterion_ce, device, lambda_cl):
+def evaluate(model, loader, criterion_ce, device, lambda_aux):
     model.eval()
     total_loss = 0
     all_preds = []
@@ -184,8 +184,8 @@ def evaluate(model, loader, criterion_ce, device, lambda_cl):
             loss_aux_t = criterion_ce(aux_t_logits, labels)
 
             # 3. 组合联合损失
-            loss_cl = loss_aux_v + loss_aux_t
-            loss = loss_ce + lambda_cl * loss_cl
+            loss_aux = loss_aux_v + loss_aux_t
+            loss = loss_ce + lambda_aux * loss_aux
 
             total_loss += loss.item()
 
@@ -292,7 +292,7 @@ def main():
 
             # 关键步骤：先跑一次验证，确立当前的基准线，防止刚加载就被覆盖
             logger.info("📊 Evaluating baseline performance (please wait)...")
-            _, _, init_f1 = evaluate(model, dev_loader, criterion_ce, device, args.lambda_cl)
+            _, _, init_f1 = evaluate(model, dev_loader, criterion_ce, device, args.lambda_aux)
             best_f1 = init_f1
             logger.info(f"🏁 Resuming with Baseline F1: {best_f1:.4f}")
             logger.info("=" * 40 + "\n")
@@ -307,14 +307,14 @@ def main():
     logger.info("🔥 Start Joint Training Loop...")
 
     for epoch in range(1, args.epochs + 1):
-        # 传入 lambda_cl 控制对比损失占比
+
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, criterion_ce, device, epoch,
-            args.lambda_cl, args.accumulation_steps, scheduler, scaler
+            args.lambda_aux, args.accumulation_steps, scheduler, scaler
         )
         logger.info(f"[Epoch {epoch}] Train Total Loss: {train_loss:.4f} | Acc: {train_acc:.4f}")
 
-        val_loss, val_acc, val_f1 = evaluate(model, dev_loader, criterion_ce, device, args.lambda_cl)
+        val_loss, val_acc, val_f1 = evaluate(model, dev_loader, criterion_ce, device, args.lambda_aux)
         logger.info(f"[Epoch {epoch}] Val Total Loss: {val_loss:.4f} | Acc: {val_acc:.4f} | F1: {val_f1:.4f}")
 
 

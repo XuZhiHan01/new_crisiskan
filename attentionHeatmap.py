@@ -1,147 +1,166 @@
-# visualize_attention.py
-
 import os
+import argparse
 import torch
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 from PIL import Image
+from transformers import AutoTokenizer
 
-# 导入你现有的模块
+# 导入你的现有组件
 from data import TextProcessor, get_transforms, TASK_CONFIG
 from modules import (
-    ResNetVisualEncoder,
-    BERTweetTextEncoder,
+    ConvNextVisualEncoder,
+    DebertaTextEncoder,
     CGMANFusion,
     CrisisKANClassifier,
     ModularCrisisModel
 )
 
 
-def build_cgman_model(device, num_classes):
-    """重建 C-GMAN 模型并加载权重"""
-    vis_enc = ResNetVisualEncoder(weights_path=None, pretrained=False)
-    txt_enc = BERTweetTextEncoder(model_path='../local_models/vinai/bertweet-base')
+def parse_args():
+    parser = argparse.ArgumentParser(description="Generate C-GMAN Cross-Attention Heatmaps")
+    parser.add_argument('--task_name', type=str, default='task2')
 
-    fusion = CGMANFusion(
-        visual_dim=vis_enc.output_dim,
-        text_dim=txt_enc.output_dim,
-        embed_dim=256,
-        num_heads=4,
-        layers=1
-    )
+    parser.add_argument('--model_path', type=str,
+                        default='/home/tSdu/xzh/crisisKAN/crisiskan/new_crisiskan/output_cgman/'
+                                'task2/task2_lamda_0.1/best_model.pt',
+                        help='最优模型的权重路径')
 
+    parser.add_argument('--image_path', type=str,
+                        default='/home/tSdu/xzh/crisisKAN/crisiskan/datasets/settingA/data_image/'
+                                'california_wildfires/10_10_2017/917793137925459968_0.jpg',
+                        help='测试用的灾害图片路径')
+
+    parser.add_argument('--text', type=str,
+                        default='California wildfires destroy more than 50 structures',
+                        help='图片对应的推文文本')
+
+    parser.add_argument('--text_model_path', type=str, default='../local_models/deberta-v3-base')
+    parser.add_argument('--embed_dim', type=int, default=256)
+    parser.add_argument('--output_dir', type=str, default='./heatmaps')
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    print("⏳ 正在加载 C-GMAN 模型 (含深层监督机制)...")
+    # 1. 实例化预处理与分词器
+    text_proc = TextProcessor(model_name=args.text_model_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.text_model_path)
+    eval_transform = get_transforms(mode='eval')
+    num_classes = TASK_CONFIG[args.task_name]['num_classes']
+
+    # 2. 组装模型
+    vis_enc = ConvNextVisualEncoder()
+    txt_enc = DebertaTextEncoder(model_path=args.text_model_path)
+    fusion = CGMANFusion(visual_dim=vis_enc.output_dim, text_dim=txt_enc.output_dim, embed_dim=args.embed_dim)
     cls_head = CrisisKANClassifier(input_dim=fusion.output_dim, num_classes=num_classes)
-    model = ModularCrisisModel(vis_enc, txt_enc, fusion, cls_head)
 
-    # 替换为你实际训练出的权重路径
-    ckpt_path = './output_cgman/cgman_resnet_bertweet_exp/best_model.pt'
-    if os.path.exists(ckpt_path):
-        model.load_state_dict(torch.load(ckpt_path, map_location=device))
-        print("✅ Weights Loaded!")
-    else:
-        print("⚠️ Warning: Checkpoint not found, using random weights for demonstration.")
+    # 🌟 必须加上 num_classes，匹配带有防偷懒机制的权重
+    model = ModularCrisisModel(vis_enc, txt_enc, fusion, cls_head, num_classes=num_classes, embed_dim=args.embed_dim)
 
+    # 加载权重
+    model.load_state_dict(torch.load(args.model_path, map_location=device))
     model.to(device)
     model.eval()
-    return model
 
+    print("🖼️ 正在处理输入图像与文本...")
+    # 3. 处理输入数据
+    image = Image.open(args.image_path).convert('RGB')
+    image_tensor = eval_transform(image).unsqueeze(0).to(device)  # (1, 3, 224, 224)
 
-def visualize_attention(image_path, text, model, text_processor, device, output_path):
-    # 1. 准备数据
-    transform = get_transforms(mode='eval')
-    raw_img = Image.open(image_path).convert('RGB')
-    img_tensor = transform(raw_img).unsqueeze(0).to(device)  # (1, 3, 224, 224)
+    # 这里的 TextProcessor 已经支持直接调用
+    text_inputs = text_proc(args.text)
+    text_inputs = {k: v.unsqueeze(0).to(device) for k, v in text_inputs.items()}
 
-    text_tokens = text_processor(text)
-    text_tokens = {k: v.unsqueeze(0).to(device) for k, v in text_tokens.items()}
+    # 获取 token 对应的实际单词列表
+    tokens = tokenizer.convert_ids_to_tokens(text_inputs['input_ids'][0])
 
-    inputs = {'image': img_tensor, 'text_tokens': text_tokens}
-
-    # 2. 注册 Hook，优雅提取内部交互特征 (完美规避黑盒问题)
-    features = {}
-
-    def hook_v(module, input, output): features['v_intra'] = output
-
-    def hook_t(module, input, output): features['t_intra'] = output
-
-    # 挂载到自注意力输出层
-    handle_v = model.fusion_module.vis_self_attn.register_forward_hook(hook_v)
-    handle_t = model.fusion_module.txt_self_attn.register_forward_hook(hook_t)
-
-    # 3. 前向推理
+    print("🧠 正在深入模型提取跨模态注意力矩阵...")
+    # 4. 提取交叉注意力权重
     with torch.no_grad():
-        logits = model(inputs)
-        pred_id = torch.argmax(logits, dim=1).item()
+        v_feat = model.visual_encoder(image_tensor)
+        t_feat = model.text_encoder(text_inputs)
 
-    # 卸载 Hook
-    handle_v.remove()
-    handle_t.remove()
+        v_embed = model.fusion_module.vis_proj(v_feat)
+        t_embed = model.fusion_module.text_proj(t_feat)
+        v_intra = model.fusion_module.vis_self_attn(v_embed)
+        t_intra = model.fusion_module.txt_self_attn(t_embed)
 
-    # 4. 手动计算 Text-to-Image 的跨模态注意力分布
-    v_intra = features['v_intra']  # (1, 49, 256)
-    t_intra = features['t_intra']  # (1, Seq, 256)
+        # 提取 Text2Img 交叉注意力权重
+        attn_output, attn_weights = model.fusion_module.text2img_cross_attn.layers[0].multihead_attn(
+            query=t_intra,
+            key=v_intra,
+            value=v_intra,
+            need_weights=True
+        )
+        attn_weights = attn_weights.squeeze(0).cpu().numpy()  # (Seq_Len, 49)
 
-    # 用文本的全局 [CLS] Token (索引0) 去 Query 图片的 49 个网格
-    text_cls = t_intra[:, 0:1, :]  # (1, 1, 256)
-    attn_weights = torch.bmm(text_cls, v_intra.transpose(1, 2))  # (1, 1, 49)
+    print(f"🎨 正在叠加生成高清热力图，结果将保存至 {args.output_dir}...")
+    # 5. 可视化与保存 (🌟 关键修改：恢复原图的真实高清分辨率)
+    orig_img = cv2.imread(args.image_path)
+    # 获取原图的真实高度和宽度 (例如 1920x1080)
+    real_h, real_w = orig_img.shape[:2]
 
-    # 缩放点积注意力公式计算概率
-    attn_weights = torch.softmax(attn_weights / np.sqrt(256), dim=-1)
+    # 用来收集所有有效单词的注意力分布，以便最后计算整体均值
+    valid_attn_list = []
 
-    # 将 (49,) reshape 成 (7, 7) 的空间热力图
-    attn_map = attn_weights.squeeze().cpu().numpy()
-    attn_map = attn_map.reshape(7, 7)
+    # ==========================================
+    # 阶段 A：生成每个有效单词的高清热力图
+    # ==========================================
+    for idx, token in enumerate(tokens):
+        clean_token = token.replace('Ġ', '').replace(' ', '').replace('##', '')
+        if clean_token in ['[CLS]', '[SEP]', '[PAD]', '<s>', '</s>', '<pad>', '', '.', ',', ';', ':', 'http', 'https']:
+            continue
 
-    # 5. 生成可视化图像
-    img_bgr = cv2.imread(image_path)
-    img_bgr = cv2.resize(img_bgr, (224, 224))
+        token_attn_raw = attn_weights[idx]
+        valid_attn_list.append(token_attn_raw)
 
-    # 归一化并上采样到 224x224
-    attn_map_resized = cv2.resize(attn_map, (224, 224), interpolation=cv2.INTER_CUBIC)
-    attn_map_norm = np.uint8(255 * (attn_map_resized - attn_map_resized.min()) /
-                             (attn_map_resized.max() - attn_map_resized.min() + 1e-8))
+        token_attn = token_attn_raw.reshape(7, 7)
 
-    # 映射为伪彩色热力图 (红高蓝低)
-    heatmap = cv2.applyColorMap(attn_map_norm, cv2.COLORMAP_JET)
+        token_attn = token_attn - np.min(token_attn)
+        if np.max(token_attn) > 0:
+            token_attn = token_attn / np.max(token_attn)
 
-    # 叠加 (0.6为原图权重，0.4为热力图权重)
-    overlay = cv2.addWeighted(img_bgr, 0.6, heatmap, 0.4, 0)
+        # 🌟 关键修改：将 7x7 的热力图直接插值放大到原图的真实尺寸 (real_w, real_h)
+        heatmap = cv2.resize(token_attn, (real_w, real_h))
+        heatmap = np.uint8(255 * heatmap)
+        heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
 
-    # 6. 绘图并保存
-    plt.figure(figsize=(12, 5))
+        # 叠加到高清原图上
+        superimposed_img = heatmap_color * 0.4 + orig_img * 0.6
 
-    plt.subplot(1, 2, 1)
-    plt.imshow(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
-    plt.title("Original Image")
-    plt.axis('off')
+        save_path = os.path.join(args.output_dir, f"attn_word_{idx}_{clean_token}.jpg")
+        cv2.imwrite(save_path, superimposed_img)
+        print(f"   ✅ 已生成单词 '{clean_token}' 的高清热力图 -> {save_path}")
 
-    plt.subplot(1, 2, 2)
-    plt.imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
-    plt.title(f"Attention Heatmap (Pred Class: {pred_id})")
-    plt.axis('off')
+    # ==========================================
+    # 阶段 B：生成整体关注度 (Overall Focus) 高清热力图
+    # ==========================================
+    if valid_attn_list:
+        overall_attn_raw = np.mean(valid_attn_list, axis=0)
+        overall_attn = overall_attn_raw.reshape(7, 7)
 
-    # 在底部显示推文内容
-    import textwrap
-    wrapped_text = textwrap.fill(text, width=80)
-    plt.suptitle(f"Tweet: {wrapped_text}", fontsize=10, y=0.05)
+        overall_attn = overall_attn - np.min(overall_attn)
+        if np.max(overall_attn) > 0:
+            overall_attn = overall_attn / np.max(overall_attn)
 
-    plt.tight_layout(rect=[0, 0.1, 1, 1])
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    print(f"✅ 可视化结果已保存至: {output_path}")
+        # 🌟 关键修改：将整体热力图也放大到真实尺寸
+        overall_heatmap = cv2.resize(overall_attn, (real_w, real_h))
+        overall_heatmap = np.uint8(255 * overall_heatmap)
+        overall_heatmap_color = cv2.applyColorMap(overall_heatmap, cv2.COLORMAP_JET)
 
+        # 叠加到高清原图上
+        overall_superimposed = overall_heatmap_color * 0.4 + orig_img * 0.6
+
+        overall_save_path = os.path.join(args.output_dir, "attn_overall_focus.jpg")
+        cv2.imwrite(overall_save_path, overall_superimposed)
+        print(f"\n   🌟 【核心输出】已生成模型整体视觉焦点高清热力图 -> {overall_save_path}")
+
+    print("\n🎉 全部生成完毕！快去 heatmaps 文件夹查看高清大图吧！")
 
 if __name__ == "__main__":
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    text_processor = TextProcessor(model_name='../local_models/vinai/bertweet-base')
-    model = build_cgman_model(device, num_classes=8)  # Task 2 是 8 个类别
-
-    # ================= 替换为你真实的测试图片和推文 =================
-    test_image_path = "/home/tSdu/xzh/crisisKAN/crisiskan/datasets/settingA/data_image/california_wildfires/10_10_2017/917793137925459968_0.jpg"  # 换成你硬盘里存在的图
-    test_text = "California wildfires destroy more than 50 structures"
-    output_img_path = "./attention_demo.png"
-
-    if os.path.exists(test_image_path):
-        visualize_attention(test_image_path, test_text, model, text_processor, device, output_img_path)
-    else:
-        print(f"❌ 找不到图片: {test_image_path}，请修改路径后再试。")
+    main()
